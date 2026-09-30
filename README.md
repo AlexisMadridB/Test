@@ -84,7 +84,7 @@ python app.py                   # abre http://127.0.0.1:5000
 
 ## Desplegar en Render
 
-1. Sube el proyecto a GitHub (con la carpeta `pdfs/` incluida). **No subas el `.env`**; ya está en `.gitignore`.
+1. Sube el proyecto a GitHub (con la carpeta `pdfs/` incluida).
 2. En [render.com](https://render.com): **New → Blueprint** y elige el repositorio (usa `render.yaml`).
    Alternativa manual: **New → Web Service** con estos valores:
    - Build Command: `pip install -r requirements.txt && python build_index.py`
@@ -100,3 +100,6 @@ python app.py                   # abre http://127.0.0.1:5000
 
 - Si cambias los PDFs, vuelve a correr `python build_index.py` (en Render, un nuevo deploy lo hace solo).
 - Si el tutor responde "No encontré información…", la respuesta no está en los PDFs: es el comportamiento esperado.
+
+## Autores
+Jose Luis Patiño & Jordi Alexis Madrid | Desarrollo de Aplicaciones con IA - Facultad de matemáticas e ingenierías
