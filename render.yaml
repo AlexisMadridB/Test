@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: tutoria-rag
+    runtime: python
+    plan: free
+    # El build instala dependencias, descarga el modelo de embeddings e indexa los PDFs.
+    buildCommand: pip install -r requirements.txt && python build_index.py
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: GROQ_API_KEY
+        sync: false   # la pegas en el panel de Render, NUNCA en el repositorio
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: TUTOR_MATERIA
+        value: Bases de Datos

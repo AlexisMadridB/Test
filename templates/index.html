@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TutorIA · Tutor de {{ materia }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <h1>TutorIA</h1>
+      <p>Tutor de {{ materia }}. Responde solo con lo que dicen tus documentos.</p>
+    </header>
+
+    <main id="chat" class="chat" role="log" aria-live="polite" aria-label="Conversación">
+      <div id="empty" class="empty">
+        <p>Pregúntame lo que necesites de {{ materia }}.</p>
+        <p>Cada respuesta cita el documento y la página de donde sale.</p>
+      </div>
+    </main>
+
+    <form id="form" class="composer" autocomplete="off">
+      <label for="input" class="sr-only">Tu pregunta</label>
+      <textarea id="input" rows="1" maxlength="1000" placeholder="Escribe tu pregunta" required></textarea>
+      <button id="send" type="submit">Preguntar</button>
+    </form>
+  </div>
+  <script src="{{ url_for('static', filename='chat.js') }}"></script>
+</body>
+</html>
