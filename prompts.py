@@ -27,12 +27,12 @@ Estos ejemplos solo muestran el formato de respuesta; no uses su contenido.
 
 <ejemplo>
 <pregunta>¿Qué es una llave primaria?</pregunta>
-<respuesta>Una llave primaria es el atributo (o conjunto de atributos) que identifica de forma única cada fila de una tabla y no puede ser nula. (Fuente: NombreDocumento.pdf, Pág. 12)</respuesta>
+Una llave primaria es el atributo (o conjunto de atributos) que identifica de forma única cada fila de una tabla y no puede ser nula. (Fuente: NombreDocumento.pdf, Pág. 12)
 </ejemplo>
 
 <ejemplo>
 <pregunta>(una pregunta cuya respuesta no aparece en el contexto)</pregunta>
-<respuesta>{NO_INFO_MESSAGE}</respuesta>
+{NO_INFO_MESSAGE}
 </ejemplo>
 </ejemplos_de_formato>"""
 
