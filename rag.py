@@ -4,20 +4,22 @@ Equivale al notebook flujo_rag_groq.ipynb, pero empaquetado para una app web:
 
   PDFs -> chunks -> embeddings -> índice vectorial (numpy) -> búsqueda -> prompt aumentado -> Groq
 
-Diferencias clave con el notebook, para caber en los 512 MB del plan gratuito de Render:
-  * Los embeddings se calculan con `fastembed` (mismo modelo, sobre ONNX y sin PyTorch).
-  * La base vectorial es un arreglo de numpy guardado en disco (en vez de ChromaDB, que pesa
-    mucho en RAM). La recuperación sigue siendo vectorial: similitud coseno entre el
-    embedding de la pregunta y el de cada fragmento.
+Para caber en los 512 MB del plan gratuito de Render:
+  * Los embeddings se piden a la API de Gemini (gemini-embedding-001): el servidor NO carga
+    ningún modelo en memoria.
+  * La base vectorial es un arreglo de numpy guardado en disco (en vez de ChromaDB).
+    La recuperación sigue siendo vectorial: similitud coseno entre el embedding de la
+    pregunta y el de cada fragmento.
 """
 import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
+import httpx
 import numpy as np
-from fastembed import TextEmbedding
 from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
@@ -31,10 +33,12 @@ PDF_DIR = Path(os.getenv("PDF_DIR", BASE_DIR / "pdfs"))
 INDEX_DIR = Path(os.getenv("INDEX_DIR", BASE_DIR / "index_data"))
 EMBEDDINGS_FILE = INDEX_DIR / "embeddings.npy"
 CHUNKS_FILE = INDEX_DIR / "chunks.json"
-# La caché del modelo va dentro del proyecto para que sobreviva del build al runtime en Render.
-MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", BASE_DIR / ".cache" / "fastembed"))
 
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_DIM = 768  # gemini-embedding-001 permite reducir de 3072 a 768 sin perder mucho
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+EMBED_BATCH = 50
+
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 CHUNK_SIZE = 500
@@ -42,7 +46,7 @@ CHUNK_OVERLAP = 50
 
 
 class RAGConfigError(Exception):
-    """Falta configuración (por ejemplo la GROQ_API_KEY o los PDFs)."""
+    """Falta configuración (por ejemplo una API key o los PDFs)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -87,26 +91,10 @@ def split_pages(pages: list[dict]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 class RAGEngine:
     def __init__(self):
-        self._init_lock = threading.RLock()  # reentrante: _get_index -> build_index -> _get_embedder
-        self._embedder = None
+        self._init_lock = threading.RLock()  # reentrante: _get_index -> build_index
         self._matrix = None  # (n_fragmentos, dim) normalizada
         self._chunks = None  # lista de dicts con text/source/page
         self._llm = None
-
-    # ---- inicialización perezosa (para que Flask abra el puerto rápido) ---- #
-    def _get_embedder(self):
-        if self._embedder is None:
-            with self._init_lock:
-                if self._embedder is None:
-                    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    log.info("Cargando modelo de embeddings %s ...", EMBEDDING_MODEL)
-                    # threads=1: menos buffers internos de onnxruntime = menos RAM.
-                    self._embedder = TextEmbedding(
-                        model_name=EMBEDDING_MODEL,
-                        cache_dir=str(MODEL_CACHE_DIR),
-                        threads=1,
-                    )
-        return self._embedder
 
     def _get_llm(self):
         if self._llm is None:
@@ -118,14 +106,53 @@ class RAGEngine:
             self._llm = Groq(api_key=api_key)
         return self._llm
 
-    # ---- Paso 3: embeddings ---- #
-    def embed(self, texts: list[str]) -> np.ndarray:
-        """Devuelve una matriz (n, dim) con los vectores normalizados (norma 1)."""
-        vectors = np.array(
-            list(self._get_embedder().embed(texts, batch_size=16)), dtype="float32"
-        )
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        return vectors / np.clip(norms, 1e-12, None)
+    # ---- Paso 3: embeddings (API de Gemini) ---- #
+    def embed(self, texts: list[str], task: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
+        """Devuelve una matriz (n, dim) con los vectores normalizados (norma 1).
+
+        task: RETRIEVAL_DOCUMENT para fragmentos del PDF, RETRIEVAL_QUERY para preguntas.
+        """
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RAGConfigError(
+                "Falta la variable de entorno GEMINI_API_KEY. Créala gratis en aistudio.google.com/apikey."
+            )
+        url = GEMINI_URL.format(model=EMBEDDING_MODEL)
+        vectors = []
+        for start in range(0, len(texts), EMBED_BATCH):
+            part = texts[start : start + EMBED_BATCH]
+            body = {
+                "requests": [
+                    {
+                        "model": f"models/{EMBEDDING_MODEL}",
+                        "content": {"parts": [{"text": t}]},
+                        "taskType": task,
+                        "outputDimensionality": EMBEDDING_DIM,
+                    }
+                    for t in part
+                ]
+            }
+            data = self._post_with_retry(url, body, api_key)
+            vectors.extend(item["values"] for item in data["embeddings"])
+
+        matrix = np.array(vectors, dtype="float32")
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        return matrix / np.clip(norms, 1e-12, None)
+
+    @staticmethod
+    def _post_with_retry(url: str, body: dict, api_key: str, attempts: int = 4) -> dict:
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        for attempt in range(1, attempts + 1):
+            response = httpx.post(url, json=body, headers=headers, timeout=30)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code in (429, 500, 503) and attempt < attempts:
+                wait = 2**attempt  # 2, 4, 8 s
+                log.warning("Gemini respondió %s; reintentando en %ss", response.status_code, wait)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Error de la API de embeddings ({response.status_code}): {response.text[:300]}")
+        raise RuntimeError("No se pudo obtener embeddings de Gemini")
 
     # ---- Paso 4: base vectorial (archivos .npy + .json) ---- #
     def build_index(self) -> int:
@@ -137,7 +164,7 @@ class RAGEngine:
         if not chunks:
             raise RAGConfigError("Los PDFs no tienen texto extraíble (¿son imágenes escaneadas?).")
 
-        matrix = self.embed([c["text"] for c in chunks])
+        matrix = self.embed([c["text"] for c in chunks], task="RETRIEVAL_DOCUMENT")
 
         INDEX_DIR.mkdir(parents=True, exist_ok=True)
         np.save(EMBEDDINGS_FILE, matrix)
@@ -154,24 +181,28 @@ class RAGEngine:
             with self._init_lock:
                 if self._matrix is None:
                     if EMBEDDINGS_FILE.exists() and CHUNKS_FILE.exists():
-                        self._matrix = np.load(EMBEDDINGS_FILE)
-                        with open(CHUNKS_FILE, encoding="utf-8") as f:
-                            self._chunks = json.load(f)
-                        log.info("Índice cargado: %d fragmentos", len(self._chunks))
+                        matrix = np.load(EMBEDDINGS_FILE)
+                        if matrix.shape[1] != EMBEDDING_DIM:
+                            log.info("El índice tiene otra dimensión: reconstruyéndolo...")
+                            self.build_index()
+                        else:
+                            self._matrix = matrix
+                            with open(CHUNKS_FILE, encoding="utf-8") as f:
+                                self._chunks = json.load(f)
+                            log.info("Índice cargado: %d fragmentos", len(self._chunks))
                     else:
                         log.info("No hay índice: construyéndolo ahora...")
                         self.build_index()  # deja self._matrix y self._chunks listos
         return self._matrix, self._chunks
 
     def warmup(self):
-        """Carga índice y modelo por adelantado (se llama al arrancar)."""
+        """Carga el índice por adelantado (se llama al arrancar)."""
         self._get_index()
-        self._get_embedder()
 
     # ---- Paso 5: recuperación (similitud coseno) ---- #
     def retrieve(self, query: str, k: int = TOP_K) -> list[dict]:
         matrix, chunks = self._get_index()
-        query_vec = self.embed([query])[0]
+        query_vec = self.embed([query], task="RETRIEVAL_QUERY")[0]
         scores = matrix @ query_vec  # vectores normalizados => producto punto = coseno
         top = np.argsort(scores)[::-1][:k]
         return [

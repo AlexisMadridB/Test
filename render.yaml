@@ -3,7 +3,7 @@ services:
     name: tutoria-rag
     runtime: python
     plan: free
-    # El build instala dependencias, descarga el modelo de embeddings e indexa los PDFs.
+    # El build instala dependencias e indexa los PDFs (pide los embeddings a la API de Gemini).
     buildCommand: pip install -r requirements.txt && python build_index.py
     startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     healthCheckPath: /health
@@ -12,6 +12,8 @@ services:
         value: 3.11.9
       - key: GROQ_API_KEY
         sync: false   # la pegas en el panel de Render, NUNCA en el repositorio
+      - key: GEMINI_API_KEY
+        sync: false   # idem: créala gratis en aistudio.google.com/apikey
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
       - key: TUTOR_MATERIA
