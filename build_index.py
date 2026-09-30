@@ -1,4 +1,4 @@
-"""Construye la base vectorial (ChromaDB) a partir de los PDFs de la carpeta pdfs/.
+"""Construye el índice vectorial (embeddings en numpy) a partir de los PDFs de la carpeta pdfs/.
 
 Uso:  python build_index.py
 Render lo ejecuta durante el build, así el servidor arranca con el índice listo.
@@ -16,4 +16,4 @@ if __name__ == "__main__":
     except RAGConfigError as exc:
         print(f"[ERROR] {exc}")
         sys.exit(1)
-    print(f"[OK] Base vectorial creada con {total} fragmentos.")
+    print(f"[OK] Índice vectorial creado con {total} fragmentos.")

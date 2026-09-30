@@ -3,6 +3,6 @@ venv/
 .venv/
 __pycache__/
 *.pyc
-chroma_db/
+index_data/
 .cache/
 .DS_Store

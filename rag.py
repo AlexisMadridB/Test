@@ -2,20 +2,21 @@
 
 Equivale al notebook flujo_rag_groq.ipynb, pero empaquetado para una app web:
 
-  PDFs -> chunks -> embeddings -> ChromaDB -> búsqueda -> prompt aumentado -> Groq
+  PDFs -> chunks -> embeddings -> índice vectorial (numpy) -> búsqueda -> prompt aumentado -> Groq
 
-Diferencia clave con el notebook: los embeddings se calculan con `fastembed`
-(mismo modelo, pero sobre ONNX y sin PyTorch). Así la app cabe en los 512 MB
-del plan gratuito de Render.
+Diferencias clave con el notebook, para caber en los 512 MB del plan gratuito de Render:
+  * Los embeddings se calculan con `fastembed` (mismo modelo, sobre ONNX y sin PyTorch).
+  * La base vectorial es un arreglo de numpy guardado en disco (en vez de ChromaDB, que pesa
+    mucho en RAM). La recuperación sigue siendo vectorial: similitud coseno entre el
+    embedding de la pregunta y el de cada fragmento.
 """
+import json
 import logging
 import os
 import threading
 from pathlib import Path
 
-import chromadb
 import numpy as np
-from chromadb.config import Settings
 from fastembed import TextEmbedding
 from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -27,12 +28,13 @@ log = logging.getLogger("tutoria.rag")
 
 BASE_DIR = Path(__file__).resolve().parent
 PDF_DIR = Path(os.getenv("PDF_DIR", BASE_DIR / "pdfs"))
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR", BASE_DIR / "chroma_db"))
+INDEX_DIR = Path(os.getenv("INDEX_DIR", BASE_DIR / "index_data"))
+EMBEDDINGS_FILE = INDEX_DIR / "embeddings.npy"
+CHUNKS_FILE = INDEX_DIR / "chunks.json"
 # La caché del modelo va dentro del proyecto para que sobreviva del build al runtime en Render.
 MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", BASE_DIR / ".cache" / "fastembed"))
 
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-COLLECTION_NAME = "tutoria"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 CHUNK_SIZE = 500
@@ -85,10 +87,10 @@ def split_pages(pages: list[dict]) -> list[dict]:
 # --------------------------------------------------------------------------- #
 class RAGEngine:
     def __init__(self):
-        self._init_lock = threading.RLock()  # reentrante: _get_collection -> build_index -> _get_embedder
+        self._init_lock = threading.RLock()  # reentrante: _get_index -> build_index -> _get_embedder
         self._embedder = None
-        self._chroma = None
-        self._collection = None
+        self._matrix = None  # (n_fragmentos, dim) normalizada
+        self._chunks = None  # lista de dicts con text/source/page
         self._llm = None
 
     # ---- inicialización perezosa (para que Flask abra el puerto rápido) ---- #
@@ -98,17 +100,13 @@ class RAGEngine:
                 if self._embedder is None:
                     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
                     log.info("Cargando modelo de embeddings %s ...", EMBEDDING_MODEL)
+                    # threads=1: menos buffers internos de onnxruntime = menos RAM.
                     self._embedder = TextEmbedding(
-                        model_name=EMBEDDING_MODEL, cache_dir=str(MODEL_CACHE_DIR)
+                        model_name=EMBEDDING_MODEL,
+                        cache_dir=str(MODEL_CACHE_DIR),
+                        threads=1,
                     )
         return self._embedder
-
-    def _client(self):
-        if self._chroma is None:
-            self._chroma = chromadb.PersistentClient(
-                path=str(CHROMA_DIR), settings=Settings(anonymized_telemetry=False)
-            )
-        return self._chroma
 
     def _get_llm(self):
         if self._llm is None:
@@ -121,14 +119,17 @@ class RAGEngine:
         return self._llm
 
     # ---- Paso 3: embeddings ---- #
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        vectors = np.array(list(self._get_embedder().embed(texts)), dtype="float32")
+    def embed(self, texts: list[str]) -> np.ndarray:
+        """Devuelve una matriz (n, dim) con los vectores normalizados (norma 1)."""
+        vectors = np.array(
+            list(self._get_embedder().embed(texts, batch_size=16)), dtype="float32"
+        )
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        return (vectors / np.clip(norms, 1e-12, None)).tolist()
+        return vectors / np.clip(norms, 1e-12, None)
 
-    # ---- Paso 4: base vectorial ---- #
+    # ---- Paso 4: base vectorial (archivos .npy + .json) ---- #
     def build_index(self) -> int:
-        """Lee los PDFs y (re)crea la base vectorial. Devuelve # de fragmentos."""
+        """Lee los PDFs y (re)crea el índice en disco. Devuelve # de fragmentos."""
         if not PDF_DIR.exists() or not list(PDF_DIR.glob("*.pdf")):
             raise RAGConfigError(f"No hay PDFs en '{PDF_DIR}'. Agrega tus documentos ahí.")
 
@@ -136,70 +137,52 @@ class RAGEngine:
         if not chunks:
             raise RAGConfigError("Los PDFs no tienen texto extraíble (¿son imágenes escaneadas?).")
 
-        client = self._client()
-        try:
-            client.delete_collection(COLLECTION_NAME)  # reconstruir desde cero
-        except Exception:
-            pass  # no existía todavía
-        collection = client.create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-        )
+        matrix = self.embed([c["text"] for c in chunks])
 
-        batch = 64
-        for start in range(0, len(chunks), batch):
-            part = chunks[start : start + batch]
-            collection.add(
-                ids=[c["id"] for c in part],
-                documents=[c["text"] for c in part],
-                metadatas=[{"source": c["source"], "page": c["page"]} for c in part],
-                embeddings=self.embed([c["text"] for c in part]),
-            )
-        self._collection = collection
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        np.save(EMBEDDINGS_FILE, matrix)
+        with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, ensure_ascii=False)
+
+        self._matrix = matrix
+        self._chunks = chunks
         log.info("Índice creado: %d fragmentos", len(chunks))
         return len(chunks)
 
-    def _get_collection(self):
-        if self._collection is None:
+    def _get_index(self):
+        if self._matrix is None:
             with self._init_lock:
-                if self._collection is None:
-                    try:
-                        collection = self._client().get_collection(COLLECTION_NAME)
-                        empty = collection.count() == 0
-                    except Exception:
-                        empty = True
-                    if empty:
-                        log.info("No hay índice: construyéndolo ahora...")
-                        self.build_index()  # deja self._collection listo
+                if self._matrix is None:
+                    if EMBEDDINGS_FILE.exists() and CHUNKS_FILE.exists():
+                        self._matrix = np.load(EMBEDDINGS_FILE)
+                        with open(CHUNKS_FILE, encoding="utf-8") as f:
+                            self._chunks = json.load(f)
+                        log.info("Índice cargado: %d fragmentos", len(self._chunks))
                     else:
-                        self._collection = collection
-        return self._collection
+                        log.info("No hay índice: construyéndolo ahora...")
+                        self.build_index()  # deja self._matrix y self._chunks listos
+        return self._matrix, self._chunks
 
     def warmup(self):
         """Carga índice y modelo por adelantado (se llama al arrancar)."""
-        self._get_collection()
+        self._get_index()
         self._get_embedder()
 
-    # ---- Paso 5: recuperación ---- #
+    # ---- Paso 5: recuperación (similitud coseno) ---- #
     def retrieve(self, query: str, k: int = TOP_K) -> list[dict]:
-        collection = self._get_collection()
-        result = collection.query(
-            query_embeddings=self.embed([query]),
-            n_results=k,
-            include=["documents", "metadatas", "distances"],
-        )
-        fragments = []
-        for text, meta, dist in zip(
-            result["documents"][0], result["metadatas"][0], result["distances"][0]
-        ):
-            fragments.append(
-                {
-                    "text": text,
-                    "source": meta["source"],
-                    "page": meta["page"],
-                    "score": round(1 - dist, 3),  # similitud coseno
-                }
-            )
-        return fragments
+        matrix, chunks = self._get_index()
+        query_vec = self.embed([query])[0]
+        scores = matrix @ query_vec  # vectores normalizados => producto punto = coseno
+        top = np.argsort(scores)[::-1][:k]
+        return [
+            {
+                "text": chunks[i]["text"],
+                "source": chunks[i]["source"],
+                "page": chunks[i]["page"],
+                "score": round(float(scores[i]), 3),
+            }
+            for i in top
+        ]
 
     # ---- Pasos 6 y 7: prompt aumentado + generación ---- #
     def answer(self, question: str, history: list[dict] | None = None) -> dict:
